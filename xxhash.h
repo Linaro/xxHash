@@ -2699,10 +2699,13 @@ XXH_PUBLIC_API XXH64_hash_t XXH64_hashFromCanonical(const XXH64_canonical_t* src
 #    include <immintrin.h>
 #  elif defined(__SSE2__)
 #    include <emmintrin.h>
-#  elif defined(__ARM_NEON__) || defined(__ARM_NEON)
+#  elif (defined(__ARM_NEON__) || defined(__ARM_NEON)) \
+  && !(defined(__ARM_SVE__) || defined(__ARM_SVE))
 #    define inline __inline__  /* circumvent a clang bug */
 #    include <arm_neon.h>
 #    undef inline
+#  elif defined(__ARM_SVE__) || defined(__ARM_SVE)
+#    include <arm_sve.h>
 #  endif
 #elif defined(_MSC_VER)
 #  include <intrin.h>
@@ -2818,6 +2821,7 @@ enum XXH_VECTOR_TYPE /* fake enum */ {
     XXH_AVX512 = 3,  /*!< AVX512 for Skylake and Icelake */
     XXH_NEON   = 4,  /*!< NEON for most ARMv7-A and all AArch64 */
     XXH_VSX    = 5,  /*!< VSX and ZVector for POWER8/z13 (64-bit) */
+    XXH_SVE    = 6,  /*!< SVE for ARMv8-A and ARMv9-A */
 };
 /*!
  * @ingroup tuning
@@ -2839,6 +2843,7 @@ enum XXH_VECTOR_TYPE /* fake enum */ {
 #  define XXH_AVX512 3
 #  define XXH_NEON   4
 #  define XXH_VSX    5
+#  define XXH_SVE    6
 #endif
 
 #ifndef XXH_VECTOR    /* can be defined on command line */
@@ -2850,6 +2855,7 @@ enum XXH_VECTOR_TYPE /* fake enum */ {
 #    define XXH_VECTOR XXH_SSE2
 #  elif defined(__GNUC__) /* msvc support maybe later */ \
   && (defined(__ARM_NEON__) || defined(__ARM_NEON)) \
+  && (!(defined(__ARM_SVE__) || defined(__ARM_SVE))) \
   && (defined(__LITTLE_ENDIAN__) /* We only support little endian NEON */ \
     || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
 #    define XXH_VECTOR XXH_NEON
@@ -2857,6 +2863,11 @@ enum XXH_VECTOR_TYPE /* fake enum */ {
      || (defined(__s390x__) && defined(__VEC__)) \
      && defined(__GNUC__) /* TODO: IBM XL */
 #    define XXH_VECTOR XXH_VSX
+#  elif defined(__GNUC__) /* msvc support maybe later */ \
+  && (defined(__ARM_SVE__) || defined(__ARM_SVE)) \
+  && (defined(__LITTLE_ENDIAN__) /* We only support little endian SVE */ \
+    || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+#    define XXH_VECTOR XXH_SVE
 #  else
 #    define XXH_VECTOR XXH_SCALAR
 #  endif
@@ -4026,6 +4037,7 @@ XXH3_accumulate_512_neon( void* XXH_RESTRICT acc,
 
         size_t i;
         for (i=0; i < XXH_STRIPE_LEN / sizeof(uint64x2_t); i++) {
+	//for (i=0; i < 1; i++) {
             /* data_vec = xinput[i]; */
             uint8x16_t data_vec    = vld1q_u8(xinput  + (i * 16));
             /* key_vec  = xsecret[i];  */
@@ -4169,6 +4181,66 @@ XXH3_scrambleAcc_vsx(void* XXH_RESTRICT acc, const void* XXH_RESTRICT secret)
 
 #endif
 
+#if (XXH_VECTOR == XXH_SVE)
+
+XXH_FORCE_INLINE void
+XXH3_accumulate_512_sve(void* XXH_RESTRICT acc,
+                  const void* XXH_RESTRICT input,
+		  const void* XXH_RESTRICT secret)
+{
+    XXH_ASSERT((((size_t)acc) & 15) == 0);
+    {
+        svuint64_t data, key, mix, mix_hi, mix_lo;
+        svuint64_t acc, idx, swapped;
+        svuint64_t shift = svdup_u64(32);
+        svuint64_t subv = svdup_u64(2);
+        svbool_t p0 = svpfalse_b();
+        svbool_t p1 = svptrue_b64();
+        svbool_t pg;
+        int i;
+
+        /* create index from 1 with step 1 */
+        idx = svindex_u64(1, 1);
+        /* convert from sequence [1,2,3,4,...] to [1,0,3,2,...] */
+        p1 = svtrn1_b64(p0, p1);
+        idx = svsub_u64_m(p1, idx, subv);
+	for (i = 0; svptest_first(p1, pg=svwhilelt_b64(i,8)); i += svcntd()) {
+            acc  = svld1_u64(pg, (uint64_t *)out + i);
+            data = svld1_u64(pg, (uint64_t *)in1 + i);
+            key  = svld1_u64(pg, (uint64_t *)in2 + i);
+            mix  = sveor_u64_z(pg, data, key);
+            mix_hi = svlsr_u64_z(pg, mix, shift);
+            mix_lo = svextw_u64_z(pg, mix);
+            mix = svmad_u64_z(pg, mix_lo, mix_hi, acc);
+            /* reorder all elements in one vector by new index value */
+            swapped = svtbl_u64(data, idx);
+            acc = svadd_u64_z(pg, swapped, mix);
+            svst1(pg, (uint64_t *)out + i, acc);
+        }
+    }
+}
+
+XXH_FORCE_INLINE void
+XXH3_scrambleAcc_sve(void* XXH_RESTRICT acc,
+               const void* XXH_RESTRICT secret)
+{
+    svuint64_t xin, acc, data;
+    svbool_t pg;
+    int i;
+
+    XXH_ASSERT((((size_t)acc) & (XXH_ACC_ALIGN-1)) == 0);
+    for (i = 0; svptest_first(p1, pg=svwhilelt_b64(i,8)); i += svcntd()) {
+        xin  = svld1_u64(pg, (uint64_t *)in + i);
+        acc  = svld1_u64(pg, (uint64_t *)out + i);
+        data = svlsr_n_u64_m(pg, acc, 47);
+        acc  = sveor_u64_m(pg, xin, acc); 
+        acc = sveor_u64_m(pg, data, acc);
+        acc = svmul_n_u64_m(pg, acc, XXH_PRIME32_1);
+        svst1(pg, (uint64_t *)out + i, acc);
+    }
+}
+#endif
+
 /* scalar variants - universal */
 
 XXH_FORCE_INLINE void
@@ -4306,6 +4378,11 @@ typedef void (*XXH3_f_initCustomSecret)(void* XXH_RESTRICT, xxh_u64);
 #define XXH3_scrambleAcc    XXH3_scrambleAcc_vsx
 #define XXH3_initCustomSecret XXH3_initCustomSecret_scalar
 
+#elif (XXH_VECTOR == XXH_SVE)
+
+#define XXH3_accumulate_512 XXH3_accumulate_512_sve
+#define XXH3_scrambleAcc    XXH3_scrambleAcc_sve
+#define XXH3_initCustomSecret XXH3_initCustomSecret_scalar
 #else /* scalar */
 
 #define XXH3_accumulate_512 XXH3_accumulate_512_scalar
